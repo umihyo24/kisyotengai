@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<!-- キーバインド説明
+左クリック: グリッド上に店を設置（空きマスのみ）
+右クリック: そのマスの店を撤去
+[1] 店舗FireRate強化 / [2] 店舗Multi強化
+[A] 商品Speed強化 / [S] 商品Damage強化
+Space: ポーズ / F: 3倍速トグル
+プレイ手順: クリックで店を設置し、勇者が近づくと客モンスが湧いて追尾します。キーで即時強化。
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>商店街タワー防衛ライク最小プレイアブル</title>
+<style>
+  body { margin:0; background:#000; color:#fff; font-family:sans-serif; }
+  canvas { display:block; margin:0 auto; background:#000; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+// ================= 定数定義 =================
+const WIDTH = 960;                      // 画面幅
+const HEIGHT = 540;                     // 画面高さ
+const GRID_COLS = 16;                   // グリッド横マス数
+const GRID_ROWS = 9;                    // グリッド縦マス数
+const CELL = 48;                        // 1マスの大きさ
+const PADDING = 40;                     // グリッドの左上余白
+const STORE_SIZE = 40;                  // 店の表示サイズ
+const STORE_RANGE = 180;                // 店の反応範囲
+const HERO_RADIUS = 10;                 // 勇者の半径
+const UNIT_RADIUS = 8;                  // 客モンスの半径
+const MAX_STORES = 8;                   // 店舗最大数
+const MAX_UNITS_PER_STORE = 4;          // 店舗ごとの同時出撃上限
+const BASE_FIRE_CD = 1.0;               // 発射台基本クールダウン
+const BASE_BURST = 2;                   // まとめ湧き数
+const BASE_UNIT_SPEED = 90;             // 客モンス基本速度
+const BASE_UNIT_DAMAGE = 8;             // 客モンス基本ダメージ
+
+// ================= ゲーム状態 =================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let money = 0;                          // 所持金（今回は固定0）
+// 店舗配列（グリッド座標、クールダウン、同時数カウント）
+const stores = [];
+// 客モンス配列（位置・速度・ダメージ・alive）
+const units = [];
+// グリッド上の占有管理
+const grid = Array.from({length:GRID_ROWS},()=>Array(GRID_COLS).fill(null));
+
+// 勇者の状態
+const hero = {
+  x: -HERO_RADIUS,                      // 左端外からスタート
+  y: PADDING + GRID_ROWS*CELL/2,        // グリッド中央を進む
+  speed: 60,                            // 移動速度(px/s)
+  radius: HERO_RADIUS,
+  hp: 200,
+  maxHp: 200,
+  dead: false,
+  respawn: 0                            // リスポーンタイマ
+};
+
+// アップグレードレベル
+const storeUp = { fireRate:0, multi:0 }; // 店舗強化
+const productUp = { speed:0, damage:0 }; // 商品（弾）強化
+
+// 入力状態
+let hoveredCell = null;                 // ホバー中マス
+let paused = false;                     // ポーズ状態
+let speed = 1;                          // 早送り倍率
+
+// ================= ユーティリティ関数 =================
+// グリッド座標→ピクセル座標
+function gridToPixel(col,row){
+  return {
+    x: PADDING + col*CELL + CELL/2,
+    y: PADDING + row*CELL + CELL/2
+  };
+}
+// マウス座標→グリッド座標
+function getCell(mx,my){
+  const col = Math.floor((mx-PADDING)/CELL);
+  const row = Math.floor((my-PADDING)/CELL);
+  if(col<0||col>=GRID_COLS||row<0||row>=GRID_ROWS) return null;
+  return {col,row};
+}
+
+// ================= 入力処理 =================
+// マウス移動でホバーセル更新
+canvas.addEventListener('mousemove', e=>{
+  hoveredCell = getCell(e.offsetX, e.offsetY);
+});
+// マウスクリックで店設置/撤去
+canvas.addEventListener('mousedown', e=>{
+  const cell = getCell(e.offsetX, e.offsetY);
+  if(!cell) return;
+  if(e.button===0){
+    // 左クリック: 店を設置
+    if(!grid[cell.row][cell.col] && stores.length < MAX_STORES){
+      const pos = gridToPixel(cell.col,cell.row);
+      const store = { gx:cell.col, gy:cell.row, x:pos.x, y:pos.y, cd:0, active:0 };
+      stores.push(store);
+      grid[cell.row][cell.col]=store;
+    }
+  }else if(e.button===2){
+    // 右クリック: 撤去
+    const store = grid[cell.row][cell.col];
+    if(store){
+      grid[cell.row][cell.col]=null;
+      const idx = stores.indexOf(store);
+      if(idx>=0) stores.splice(idx,1);
+    }
+  }
+});
+// 右クリックメニューを無効化
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+
+// キーボード入力（ポーズ・早送り・強化）
+window.addEventListener('keydown', e=>{
+  if(e.target !== document.body) return; // 入力フォーカスが他にある場合は無視
+  const key = e.key.toLowerCase();
+  if(key===' '){
+    paused = !paused;                   // Space: ポーズ
+  }else if(key==='f'){
+    speed = speed===1 ? 3 : 1;          // F: 3倍速トグル
+  }else if(key==='1'){
+    storeUp.fireRate++;                 // [1] FireRate
+  }else if(key==='2'){
+    storeUp.multi++;                    // [2] Multi
+  }else if(key==='a'){
+    productUp.speed++;                  // [A] Speed
+  }else if(key==='s'){
+    productUp.damage++;                 // [S] Damage
+  }
+});
+
+// ================= ゲーム更新処理 =================
+// 勇者の更新
+function updateHero(dt){
+  if(hero.dead){
+    hero.respawn -= dt;
+    if(hero.respawn <= 0){              // リスポーン処理
+      hero.hp = hero.maxHp;
+      hero.dead = false;
+      hero.x = -hero.radius;
+    }
+    return;
+  }
+  hero.x += hero.speed * dt;            // 右へ移動
+  if(hero.x > WIDTH + hero.radius){     // 右端で左端にループ
+    hero.x = -hero.radius;
+  }
+}
+
+// 店舗の更新と湧き判定
+function updateStores(dt){
+  if(hero.dead) return;                 // 勇者死亡中は休止
+  for(const s of stores){
+    const dx = hero.x - s.x;
+    const dy = hero.y - s.y;
+    const dist = Math.hypot(dx,dy);
+    if(dist <= STORE_RANGE){            // 範囲内に入ったら
+      s.cd -= dt;
+      if(s.cd<=0 && s.active < MAX_UNITS_PER_STORE){
+        const burst = Math.min(BASE_BURST + storeUp.multi, MAX_UNITS_PER_STORE - s.active);
+        spawnUnits(s, burst);           // バースト生成
+        const rate = 1 + 0.5*storeUp.fireRate;
+        s.cd = BASE_FIRE_CD / rate;     // クールダウン再設定
+      }
+    }
+  }
+}
+
+// 店から客モンスをまとめ湧きさせる
+function spawnUnits(store, count){
+  for(let i=0;i<count;i++){
+    const jitter = (i - (count-1)/2) * 8; // 重なり防止の微妙なずらし
+    const unit = {
+      x: store.x + jitter,
+      y: store.y + jitter,
+      radius: UNIT_RADIUS,
+      speed: BASE_UNIT_SPEED * (1+0.25*productUp.speed),
+      dmg: BASE_UNIT_DAMAGE * (1+0.5*productUp.damage),
+      owner: store,
+      alive: true
+    };
+    units.push(unit);
+    store.active++;
+  }
+}
+
+// 客モンスの更新と当たり判定
+function updateUnits(dt){
+  for(const u of units){
+    if(!u.alive) continue;
+    const dx = hero.x - u.x;
+    const dy = hero.y - u.y;
+    const dist = Math.hypot(dx,dy);
+    if(dist>0){
+      const vx = dx/dist * u.speed;
+      const vy = dy/dist * u.speed;
+      u.x += vx*dt;
+      u.y += vy*dt;
+    }
+    if(!hero.dead && dist <= hero.radius + u.radius){
+      hero.hp -= u.dmg;                 // ダメージを与える
+      u.alive = false;
+      if(u.owner) u.owner.active--;     // 店のカウンタ減
+      if(hero.hp <= 0){                 // 勇者死亡判定
+        hero.hp = 0;
+        hero.dead = true;
+        hero.respawn = 3;               // 3秒後に復活
+      }
+    }
+  }
+  // 使用済みユニットを掃除
+  for(let i=units.length-1;i>=0;i--){
+    if(!units[i].alive) units.splice(i,1);
+  }
+}
+
+// ================= 描画処理 =================
+function render(){
+  ctx.clearRect(0,0,WIDTH,HEIGHT);      // 画面クリア
+
+  // グリッド線の描画
+  ctx.strokeStyle = '#333';
+  for(let c=0;c<=GRID_COLS;c++){
+    const x = PADDING + c*CELL;
+    ctx.beginPath();
+    ctx.moveTo(x, PADDING);
+    ctx.lineTo(x, PADDING + GRID_ROWS*CELL);
+    ctx.stroke();
+  }
+  for(let r=0;r<=GRID_ROWS;r++){
+    const y = PADDING + r*CELL;
+    ctx.beginPath();
+    ctx.moveTo(PADDING, y);
+    ctx.lineTo(PADDING + GRID_COLS*CELL, y);
+    ctx.stroke();
+  }
+
+  // ホバー中セルのハイライト
+  if(hoveredCell){
+    const x = PADDING + hoveredCell.col*CELL;
+    const y = PADDING + hoveredCell.row*CELL;
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.fillRect(x,y,CELL,CELL);
+    // 反応範囲プレビュー
+    const pos = gridToPixel(hoveredCell.col,hoveredCell.row);
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, STORE_RANGE, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(0,0,255,0.15)';
+    ctx.stroke();
+  }
+
+  // 店舗描画
+  for(const s of stores){
+    // 反応範囲
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, STORE_RANGE, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(0,0,255,0.1)';
+    ctx.stroke();
+    // 本体（青枠）
+    ctx.strokeStyle = 'blue';
+    ctx.strokeRect(s.x-STORE_SIZE/2, s.y-STORE_SIZE/2, STORE_SIZE, STORE_SIZE);
+  }
+
+  // 勇者描画
+  ctx.beginPath();
+  ctx.arc(hero.x, hero.y, hero.radius, 0, Math.PI*2);
+  ctx.fillStyle = 'yellow';
+  ctx.fill();
+
+  // 客モンス描画
+  ctx.fillStyle = 'cyan';
+  for(const u of units){
+    ctx.beginPath();
+    ctx.arc(u.x, u.y, u.radius, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  renderHUD();                          // HUD描画
+}
+
+// HUDのテキスト描画
+function renderHUD(){
+  ctx.fillStyle = '#fff';
+  ctx.font = '16px sans-serif';
+  let y = 20;
+  ctx.fillText(`HeroHP: ${hero.hp.toFixed(0)} / Gold: ${money} / Stores: ${stores.length}`, 10, y);
+  y += 20;
+  ctx.fillText(`Store [1]FireRate Lv${storeUp.fireRate} [2]Multi Lv${storeUp.multi}`, 10, y);
+  y += 20;
+  ctx.fillText(`Product [A]Speed Lv${productUp.speed} [S]Damage Lv${productUp.damage}`, 10, y);
+  y += 20;
+  ctx.fillText(`Left:設置 Right:撤去 Space:Pause F:3x`, 10, y);
+}
+
+// ================= メインループ =================
+let last = performance.now();           // 前フレームの時刻
+let acc = 0;                            // 固定タイムステップ用蓄積時間
+const STEP = 1/60;                      // 60fps相当
+
+function loop(now){
+  if(!paused){
+    acc += (now - last)/1000 * speed;   // 経過時間に早送り倍率を掛ける
+    while(acc >= STEP){                 // 固定タイムステップ更新
+      updateHero(STEP);
+      updateStores(STEP);
+      updateUnits(STEP);
+      acc -= STEP;
+    }
+  }
+  render();
+  last = now;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);            // ループ開始
+</script>
+</body>
+</html>
